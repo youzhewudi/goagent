@@ -497,6 +497,217 @@ def spawn_later(seconds, target, *args, **kwargs):
     return threading._start_new_thread(wrap, args, kwargs)
 
 
+if 'gevent.monkey' in sys.modules:
+    class SSLConnection(object):
+        """gevent wrapper for python2 OpenSSL.SSL.Connection"""
+
+        def __init__(self, context, sock):
+            self._context = context
+            self._sock = sock
+            self._timeout = sock.gettimeout()
+            self._connection = OpenSSL.SSL.Connection(context, sock)
+            self._makefile_refs = 0
+
+        def __getattr__(self, attr):
+            if attr not in ('_context', '_sock', '_timeout', '_connection'):
+                return getattr(self._connection, attr)
+
+        def accept(self):
+            sock, addr = self._sock.accept()
+            client = SSLConnection(sock._context, sock)
+            return client, addr
+
+        def do_handshake(self):
+            while True:
+                try:
+                    self._connection.do_handshake()
+                    break
+                except (OpenSSL.SSL.WantReadError, OpenSSL.SSL.WantX509LookupError, OpenSSL.SSL.WantWriteError):
+                    sys.exc_clear()
+                    gevent.socket.wait_readwrite(self._sock.fileno(), timeout=self._timeout)
+
+        def connect(self, address, **kwargs):
+            while True:
+                try:
+                    self._connection.connect(address, **kwargs)
+                    break
+                except (OpenSSL.SSL.WantReadError, OpenSSL.SSL.WantX509LookupError):
+                    sys.exc_clear()
+                    gevent.socket.wait_read(self._sock.fileno(), timeout=self._timeout)
+                except OpenSSL.SSL.WantWriteError:
+                    sys.exc_clear()
+                    gevent.socket.wait_write(self._sock.fileno(), timeout=self._timeout)
+
+        def send(self, data, flags=0):
+            while True:
+                try:
+                    self._connection.send(data, flags)
+                    break
+                except (OpenSSL.SSL.WantReadError, OpenSSL.SSL.WantX509LookupError):
+                    sys.exc_clear()
+                    gevent.socket.wait_read(self._sock.fileno(), timeout=self._timeout)
+                except OpenSSL.SSL.WantWriteError:
+                    sys.exc_clear()
+                    gevent.socket.wait_write(self._sock.fileno(), timeout=self._timeout)
+                except OpenSSL.SSL.SysCallError as e:
+                    if e[0] == -1 and not data:
+                        # errors when writing empty strings are expected and can be ignored
+                        return 0
+                    raise
+
+        def recv(self, bufsiz, flags=0):
+            pending = self._connection.pending()
+            if pending:
+                return self._connection.recv(min(pending, bufsiz))
+            while True:
+                try:
+                    return self._connection.recv(bufsiz, flags)
+                except (OpenSSL.SSL.WantReadError, OpenSSL.SSL.WantX509LookupError):
+                    sys.exc_clear()
+                    gevent.socket.wait_read(self._sock.fileno(), timeout=self._timeout)
+                except OpenSSL.SSL.WantWriteError:
+                    sys.exc_clear()
+                    gevent.socket.wait_write(self._sock.fileno(), timeout=self._timeout)
+                except OpenSSL.SSL.ZeroReturnError:
+                    return ''
+
+        def read(self, bufsiz, flags=0):
+            return self.recv(bufsiz, flags)
+
+        def write(self, buf, flags=0):
+            return self.sendall(buf, flags)
+
+        def makefile(self, mode='rb', bufsize=-1):
+            self._makefile_refs += 1
+            return socket._fileobject(self, mode, bufsize, close=True)
+
+        def close(self):
+            if self._makefile_refs < 1:
+                self._connection.shutdown()
+                del self._connection
+            else:
+                self._makefile_refs -= 1
+else:
+    class SSLConnection(object):
+        """wrapper for python2 OpenSSL.SSL.Connection"""
+
+        def __init__(self, context, sock):
+            self._context = context
+            self._sock = sock
+            self._timeout = sock.gettimeout()
+            self._connection = OpenSSL.SSL.Connection(context, sock)
+            self._makefile_refs = 0
+
+        def __getattr__(self, attr):
+            if attr not in ('_context', '_sock', '_timeout', '_connection'):
+                return getattr(self._connection, attr)
+
+        def accept(self):
+            sock, addr = self._sock.accept()
+            client = SSLConnection(sock._context, sock)
+            return client, addr
+
+        def do_handshake(self):
+            waited = 0
+            ticker = 1.0
+            while True:
+                try:
+                    self._connection.do_handshake()
+                    break
+                except (OpenSSL.SSL.WantReadError, OpenSSL.SSL.WantX509LookupError, OpenSSL.SSL.WantWriteError):
+                    sys.exc_clear()
+                    select.select([self._connection], [], [], ticker)
+                    waited += ticker
+                    if self._timeout and waited > self._timeout:
+                        raise socket.timeout('timed out')
+
+        def connect(self, address, **kwargs):
+            waited = 0
+            ticker = 1.0
+            while True:
+                try:
+                    self._connection.connect(address, **kwargs)
+                    break
+                except (OpenSSL.SSL.WantReadError, OpenSSL.SSL.WantX509LookupError):
+                    sys.exc_clear()
+                    select.select([self._connection], [], [], ticker)
+                    waited += ticker
+                    if self._timeout and waited > self._timeout:
+                        raise socket.timeout('timed out')
+                except OpenSSL.SSL.WantWriteError:
+                    sys.exc_clear()
+                    select.select([], [self._connection], [], ticker)
+                    waited += ticker
+                    if self._timeout and waited > self._timeout:
+                        raise socket.timeout('timed out')
+
+        def send(self, data, flags=0):
+            waited = 0
+            ticker = 1.0
+            while True:
+                try:
+                    self._connection.send(data, flags)
+                    break
+                except (OpenSSL.SSL.WantReadError, OpenSSL.SSL.WantX509LookupError):
+                    sys.exc_clear()
+                    select.select([self._connection], [], [], ticker)
+                    waited += ticker
+                    if self._timeout and waited > self._timeout:
+                        raise socket.timeout('timed out')
+                except OpenSSL.SSL.WantWriteError:
+                    sys.exc_clear()
+                    select.select([], [self._connection], [], ticker)
+                    waited += ticker
+                    if self._timeout and waited > self._timeout:
+                        raise socket.timeout('timed out')
+                except OpenSSL.SSL.SysCallError as e:
+                    if e[0] == -1 and not data:
+                        # errors when writing empty strings are expected and can be ignored
+                        return 0
+                    raise
+
+        def recv(self, bufsiz, flags=0):
+            waited = 0
+            ticker = 1.0
+            pending = self._connection.pending()
+            if pending:
+                return self._connection.recv(min(pending, bufsiz))
+            while True:
+                try:
+                    return self._connection.recv(bufsiz, flags)
+                except (OpenSSL.SSL.WantReadError, OpenSSL.SSL.WantX509LookupError):
+                    sys.exc_clear()
+                    select.select([self._connection], [], [], ticker)
+                    waited += ticker
+                    if self._timeout and waited > self._timeout:
+                        raise socket.timeout('timed out')
+                except OpenSSL.SSL.WantWriteError:
+                    sys.exc_clear()
+                    select.select([], [self._connection], [], ticker)
+                    waited += ticker
+                    if self._timeout and waited > self._timeout:
+                        raise socket.timeout('timed out')
+                except OpenSSL.SSL.ZeroReturnError:
+                    return ''
+
+        def read(self, bufsiz, flags=0):
+            return self.recv(bufsiz, flags)
+
+        def write(self, buf, flags=0):
+            return self.sendall(buf, flags)
+
+        def makefile(self, mode='rb', bufsize=-1):
+            self._makefile_refs += 1
+            return socket._fileobject(self, mode, bufsize, close=True)
+
+        def close(self):
+            if self._makefile_refs < 1:
+                self._connection.shutdown()
+                del self._connection
+            else:
+                self._makefile_refs -= 1
+
+
 class HTTPUtil(object):
     """HTTP Request Class"""
 
@@ -565,7 +776,7 @@ class HTTPUtil(object):
         self.proxy = proxy
         self.ssl_validate = ssl_validate or self.ssl_validate
         self.ssl_obfuscate = ssl_obfuscate or self.ssl_obfuscate
-        if hasattr(ssl, 'SSLContext'):
+        if sys.version_info[0] == 3:
             self.ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLSv1)
             if self.ssl_validate:
                 self.ssl_context.verify_mode = ssl.CERT_REQUIRED
@@ -573,24 +784,28 @@ class HTTPUtil(object):
             if self.ssl_obfuscate:
                 self.ssl_ciphers = ':'.join(x for x in self.ssl_ciphers.split(':') if random.random() > 0.5)
                 self.ssl_context.set_ciphers(self.ssl_ciphers)
-                #self.ssl_context.set_npn_protocols(['http/1.1'])
+            self.wrap_socket = self.ssl_context.wrap_socket
         else:
-            self.ssl_context = None
+            self.ssl_context = OpenSSL.SSL.Context(OpenSSL.SSL.TLSv1_METHOD)
+            if self.ssl_validate:
+                self.ssl_context.load_verify_locations('cacert.pem')
+            if self.ssl_obfuscate:
+                self.ssl_ciphers = ':'.join(x for x in self.ssl_ciphers.split(':') if random.random() > 0.5)
+                self.ssl_context.set_cipher_list(self.ssl_ciphers)
+            self.wrap_socket = self.pyopenssl_wrap_socket
 
-    def wrap_socket(self, *args, **kwargs):
-        if not self.ssl_has_sni:
-            kwargs.pop('server_hostname', None)
-        if self.ssl_context:
-            return self.ssl_context.wrap_socket(*args, **kwargs)
+    def pyopenssl_wrap_socket(self, sock, **kwargs):
+        connection = SSLConnection(self.ssl_context, sock)
+        if kwargs.get('server_side', False):
+            connection.set_accept_state()
         else:
-            if self.ssl_validate and 'cert_reqs' not in kwargs:
-                kwargs['cert_reqs'] = ssl.CERT_REQUIRED
-                kwargs['ca_certs'] = 'cacert.pem'
-            if 'ssl_version' not in kwargs:
-                kwargs['ssl_version'] = ssl.PROTOCOL_TLSv1
-            if self.ssl_obfuscate and 'ciphers' not in kwargs:
-                kwargs['ciphers'] = self.ssl_ciphers
-            return ssl.wrap_socket(*args, **kwargs)
+            connection.set_connect_state()
+        server_hostname = kwargs.get('server_hostname')
+        if server_hostname:
+            connection.set_tlsext_host_name(server_hostname.encode())
+        if kwargs.get('do_handshake_on_connect', True):
+            connection.do_handshake()
+        return connection
 
     def dns_resolve(self, host, dnsserver='', ipv4_only=True):
         iplist = self.dns.get(host)
@@ -699,8 +914,12 @@ class HTTPUtil(object):
                 ssl_sock.sock = sock
                 # verify SSL certificate.
                 if self.ssl_validate and address[0].endswith('.appspot.com'):
-                    cert = ssl_sock.getpeercert()
-                    commonname = next((v for ((k, v),) in cert['subject'] if k == 'commonName'))
+                    if hasattr(ssl_sock, 'get_peer_certificate'):
+                        cert = ssl_sock.get_peer_certificate()
+                        commonname = next((v for k, v in cert.get_subject().get_components() if k == 'CN'))
+                    elif hasattr(ssl_sock, 'getpeercert'):
+                        cert = ssl_sock.getpeercert()
+                        commonname = next((v for ((k, v),) in cert['subject'] if k == 'commonName'))
                     if '.google' not in commonname and not commonname.endswith('.appspot.com'):
                         raise ssl.SSLError("Host name '%s' doesn't match certificate host '%s'" % (address[0], commonname))
                 # put ssl socket object to output queobj
@@ -1138,6 +1357,7 @@ def message_html(self, title, banner, detail=''):
 
 def gae_urlfetch(method, url, headers, payload, fetchserver, **kwargs):
     # deflate = lambda x:zlib.compress(x)[2:-4]
+    assert isinstance(payload, bytes)
     if payload:
         if len(payload) < 10 * 1024 * 1024 and 'Content-Encoding' not in headers:
             zpayload = zlib.compress(payload)[2:-4]
@@ -1150,20 +1370,7 @@ def gae_urlfetch(method, url, headers, payload, fetchserver, **kwargs):
         del headers['Host']
     metadata = 'G-Method:%s\nG-Url:%s\n%s' % (method, url, ''.join('G-%s:%s\n' % (k, v) for k, v in kwargs.items() if v))
     skip_headers = http_util.skip_headers
-    if common.GAE_OBFUSCATE and 'X-Requested-With' not in headers:
-        # not a ajax request, we could abbv the headers
-        abbv_headers = http_util.abbv_headers
-        g_abbv = []
-        for keyword in [x for x in headers if x not in skip_headers]:
-            value = headers[keyword]
-            if keyword in abbv_headers and abbv_headers[keyword][1](value):
-                g_abbv.append(abbv_headers[keyword][0])
-            else:
-                metadata += '%s:%s\n' % (keyword, value)
-        if g_abbv:
-            metadata += 'G-Abbv:%s\n' % ','.join(g_abbv)
-    else:
-        metadata += ''.join('%s:%s\n' % (k.title(), v) for k, v in headers.items() if k not in skip_headers)
+    metadata += ''.join('%s:%s\n' % (k.title(), v) for k, v in headers.items() if k not in skip_headers)
     metadata = zlib.compress(metadata.encode())[2:-4]
     need_crlf = 0 if fetchserver.startswith('https') else common.GAE_CRLF
     if common.GAE_OBFUSCATE:
@@ -1371,6 +1578,9 @@ class LocalProxyServer(socketserver.ThreadingTCPServer):
             return socketserver.ThreadingTCPServer.finish_request(self, request, client_address)
         except (socket.error, ssl.SSLError) as e:
             if e.args[0] not in (errno.ECONNABORTED, errno.EPIPE):
+                raise
+        except OpenSSL.SSL.Error as e:
+            if 'bad write retry' not in e.args[-1]:
                 raise
 
 
