@@ -507,10 +507,9 @@ if 'gevent.monkey' in sys.modules:
             self._timeout = sock.gettimeout()
             self._connection = OpenSSL.SSL.Connection(context, sock)
             self._makefile_refs = 0
-
-        def __getattr__(self, attr):
-            if attr not in ('_context', '_sock', '_timeout', '_connection'):
-                return getattr(self._connection, attr)
+            self.wait_read = gevent.socket.wait_read
+            self.wait_write = gevent.socket.wait_write
+            self.wait_readwrite = gevent.socket.wait_readwrite
 
         def accept(self):
             sock, addr = self._sock.accept()
@@ -524,7 +523,7 @@ if 'gevent.monkey' in sys.modules:
                     break
                 except (OpenSSL.SSL.WantReadError, OpenSSL.SSL.WantX509LookupError, OpenSSL.SSL.WantWriteError):
                     sys.exc_clear()
-                    gevent.socket.wait_readwrite(self._sock.fileno(), timeout=self._timeout)
+                    self.wait_readwrite(self._sock.fileno(), timeout=self._timeout)
 
         def connect(self, address, **kwargs):
             while True:
@@ -533,22 +532,34 @@ if 'gevent.monkey' in sys.modules:
                     break
                 except (OpenSSL.SSL.WantReadError, OpenSSL.SSL.WantX509LookupError):
                     sys.exc_clear()
-                    gevent.socket.wait_read(self._sock.fileno(), timeout=self._timeout)
+                    self.wait_read(self._sock.fileno(), timeout=self._timeout)
                 except OpenSSL.SSL.WantWriteError:
                     sys.exc_clear()
-                    gevent.socket.wait_write(self._sock.fileno(), timeout=self._timeout)
+                    self.wait_write(self._sock.fileno(), timeout=self._timeout)
+
+        def connect_ex(self, address, **kwargs):
+            while True:
+                try:
+                    self._connection.connect(address, **kwargs)
+                    break
+                except (OpenSSL.SSL.WantReadError, OpenSSL.SSL.WantX509LookupError):
+                    sys.exc_clear()
+                    self.wait_read(self._sock.fileno(), timeout=self._timeout)
+                except OpenSSL.SSL.WantWriteError:
+                    sys.exc_clear()
+                    self.wait_write(self._sock.fileno(), timeout=self._timeout)
 
         def send(self, data, flags=0):
             while True:
                 try:
                     self._connection.send(data, flags)
                     break
-                except (OpenSSL.SSL.WantReadError, OpenSSL.SSL.WantX509LookupError):
-                    sys.exc_clear()
-                    gevent.socket.wait_read(self._sock.fileno(), timeout=self._timeout)
                 except OpenSSL.SSL.WantWriteError:
                     sys.exc_clear()
-                    gevent.socket.wait_write(self._sock.fileno(), timeout=self._timeout)
+                    self.wait_write(self._sock.fileno(), timeout=self._timeout)
+                except OpenSSL.SSL.WantReadError:
+                    sys.exc_clear()
+                    self.wait_read(self._sock.fileno(), timeout=self._timeout)
                 except OpenSSL.SSL.SysCallError as e:
                     if e[0] == -1 and not data:
                         # errors when writing empty strings are expected and can be ignored
@@ -562,12 +573,12 @@ if 'gevent.monkey' in sys.modules:
             while True:
                 try:
                     return self._connection.recv(bufsiz, flags)
-                except (OpenSSL.SSL.WantReadError, OpenSSL.SSL.WantX509LookupError):
+                except OpenSSL.SSL.WantReadError:
                     sys.exc_clear()
-                    gevent.socket.wait_read(self._sock.fileno(), timeout=self._timeout)
+                    self.wait_read(self._sock.fileno(), timeout=self._timeout)
                 except OpenSSL.SSL.WantWriteError:
                     sys.exc_clear()
-                    gevent.socket.wait_write(self._sock.fileno(), timeout=self._timeout)
+                    self.wait_write(self._sock.fileno(), timeout=self._timeout)
                 except OpenSSL.SSL.ZeroReturnError:
                     return ''
 
@@ -587,6 +598,16 @@ if 'gevent.monkey' in sys.modules:
                 del self._connection
             else:
                 self._makefile_refs -= 1
+
+        for f in ('get_context', 'pending', 'renegotiate',  'listen', 'sendall',
+                  'setblocking', 'fileno', 'shutdown', 'close', 'get_cipher_list',
+                  'getpeername', 'getsockname', 'getsockopt', 'setsockopt', 'bind',
+                  'get_app_data', 'set_app_data', 'state_string', 'sock_shutdown',
+                  'get_peer_certificate', 'get_peer_cert_chain', 'want_read', 'want_write',
+                  'set_connect_state', 'set_accept_state', 'settimeout',
+                  'set_tlsext_host_name'):
+            exec("""def %s(self, *args):
+                    return self._connection.%s(*args)\n""" % (f, f))
 else:
     class SSLConnection(object):
         """wrapper for python2 OpenSSL.SSL.Connection"""
@@ -1567,21 +1588,19 @@ class LocalProxyServer(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
 
     def close_request(self, request):
+        """make ThreadingTCPServer happy"""
         try:
             request.close()
         except:
             pass
 
-    def finish_request(self, request, client_address):
-        """make python2 SocketServer happy"""
-        try:
-            return socketserver.ThreadingTCPServer.finish_request(self, request, client_address)
-        except socket.error as e:
-            if e.args[0] not in (errno.ECONNABORTED, errno.EPIPE):
-                raise
-        except (ssl.SSLError, OpenSSL.SSL.Error) as e:
-            if 'bad write retry' not in e.args[-1]:
-                raise
+    def handle_error(self, request, client_address):
+        """make ThreadingTCPServer happy"""
+        etype, value, tb = sys.exc_info()
+        if isinstance(value, ssl.SSLError) and 'bad write retry' in value.args[1]:
+            etype = value = tb = None
+        else:
+            socketserver.ThreadingTCPServer.handle_error(self, request, client_address)
 
 
 class GAEProxyHandler(http.server.BaseHTTPRequestHandler):
@@ -1895,8 +1914,8 @@ class GAEProxyHandler(http.server.BaseHTTPRequestHandler):
                         # we can retry range fetch here
                         logging.warn('GAEProxyHandler.do_METHOD_GAE timed out, url=%r, content_length=%r, try again', self.path, content_length)
                         self.headers['Range'] = 'bytes=%d-%d' % (start, end)
-                elif isinstance(e, ssl.SSLError) and 'bad write retry' in e.args[-1]:
-                    logging.info('GAEProxyHandler.do_METHOD_GAE url=%r return %r, abort.', self.path, e)
+                elif isinstance(e, ssl.SSLError) and 'bad write retry' in e.args[1]:
+                    logging.debug('GAEProxyHandler.do_METHOD_GAE url=%r return %r, abort.', self.path, e)
                     return
                 else:
                     logging.exception('GAEProxyHandler.do_METHOD_GAE %r return %r, try again', self.path, e)
