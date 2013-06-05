@@ -151,8 +151,8 @@ class GoAgentGTK:
         self.window = window
         self.terminal = terminal
 
-        if os.system('which python3') == 0:
-            self.command[1] = 'python3'
+        #if os.system('which python3') == 0:
+        #    self.command[1] = 'python3'
 
         self.window.add(terminal)
         self.childpid = self.terminal.fork_command(self.command[0], self.command, os.getcwd())
