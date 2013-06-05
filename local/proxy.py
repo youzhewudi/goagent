@@ -1576,10 +1576,10 @@ class LocalProxyServer(socketserver.ThreadingTCPServer):
         """make python2 SocketServer happy"""
         try:
             return socketserver.ThreadingTCPServer.finish_request(self, request, client_address)
-        except (socket.error, ssl.SSLError) as e:
+        except socket.error as e:
             if e.args[0] not in (errno.ECONNABORTED, errno.EPIPE):
                 raise
-        except OpenSSL.SSL.Error as e:
+        except (ssl.SSLError, OpenSSL.SSL.Error) as e:
             if 'bad write retry' not in e.args[-1]:
                 raise
 
